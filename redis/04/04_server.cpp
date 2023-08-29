@@ -11,6 +11,55 @@
 
 const size_t k_max_msg = 4096;
 
+static void msg (const char *msg){
+    fprintf(stderr,"%s\n",msg);
+}
+
+static void die(const char *msg){
+    int err = errno;
+    fprintf(stderr,"[%d] %s\n",err,msg);
+    abort();
+}
+
+/**
+ * 文件描述符
+ * 缓存
+ * 长度
+*/
+static int32_t read_full(int fd ,char *buf,size_t n){
+    while (n > 0)
+    {
+        // read，但是不一定会读完
+        ssize_t rv = read(fd,buf,n);
+        if (rv <= 0)
+        {
+            return -1;
+        }
+        // 要保证数据读到的小于n
+        assert((size_t)rv <= n);
+        // 继续读
+        n -= (size_t)rv;
+        buf += rv;        
+    }
+    return 0;
+    
+}
+
+static int32_t write_all(int fd,const char *buf,size_t n){
+    while (n > 0)
+    {
+        size_t rv = write(fd,buf,n);
+        if (rv <= 0)
+        {
+            return -1;
+        }
+        assert((size_t)rv <= n);
+        n -= (size_t)rv;
+        buf += rv;
+    }
+    return 0;    
+}
+
 static int32_t one_request(int connfd){
     // 4 bytes header
     char rbuf[4+k_max_msg+1];
@@ -55,15 +104,6 @@ static int32_t one_request(int connfd){
 }
 
 
-static void msg (const char *msg){
-    fprintf(stderr,"%s\n",msg);
-}
-
-static void die(const char *msg){
-    int err = errno;
-    fprintf(stderr,"[%d] %s\n",err,msg);
-    abort();
-}
 
 static void do_something(int connfd) {
     char rbuf[64] = {};
@@ -78,44 +118,7 @@ static void do_something(int connfd) {
     write(connfd,wbuf,strlen(wbuf));    
 }
 
-/**
- * 文件描述符
- * 缓存
- * 长度
-*/
-static int32_t read_full(int fd ,char *buf,size_t n){
-    while (n > 0)
-    {
-        // read，但是不一定会读完
-        ssize_t rv = read(fd,buf,n);
-        if (rv <= 0)
-        {
-            return -1;
-        }
-        // 要保证数据读到的小于n
-        assert((size_t)rv <= n);
-        // 继续读
-        n -= (size_t)rv;
-        buf += rv;        
-    }
-    return 0;
-    
-}
 
-static int32_t write_all(int fd,const char *buf,size_t n){
-    while (n > 0)
-    {
-        size_t rv = write(fd,buf,n);
-        if (rv <= 0)
-        {
-            return -1;
-        }
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        buf += rv;
-    }
-    return 0;    
-}
 
 int main() {
     int fd = socket(AF_INET,SOCK_STREAM,0);
@@ -162,7 +165,7 @@ int main() {
             
         }
         
-        do_something(connfd);
+        // do_something(connfd);
         close(connfd);        
     }
 
