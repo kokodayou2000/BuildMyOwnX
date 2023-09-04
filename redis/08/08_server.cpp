@@ -13,6 +13,11 @@
 #include <string>
 #include <vector>
 #include <map>
+#include "hashtable.h"
+
+#define container_of(ptr, type, member) ({                  \
+    const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
+    (type *)( (char *)__mptr - offsetof(type, member) ); })
 
 static void msg(const char *msg)
 {
@@ -157,21 +162,57 @@ enum
     RES_NX = 2,
 };
 
+// key 空间的数据结构
+static struct
+{
+    HMap db;
+} g_data;
+
+// key的结构
+struct Entry
+{
+    struct HNode node;
+    std::string key;
+    std::string val;
+};
+
+static bool entry_eq(HNode *lhs, HNode *rhs)
+{
+    struct Entry *le = container_of(lhs, struct Entry, node);
+    struct Entry *re = container_of(rhs, struct Entry, node);
+    return lhs->hcode == rhs->hcode && le->key == re->key;
+}
+
+// 和h 进行 hash, 只要同一个数，经过这个算法得到的结果是一样的就行
+static uint64_t str_hash(const uint8_t *data, size_t len)
+{
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++)
+    {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
 static std::map<std::string, std::string> g_map;
 
 /**
- * cmd 类似 get k1 or set k1 k2
- * cmd[0] 命令 cmd[1] key
+ * 将只带的hashMap替换成自定义的hashtable
  */
 static uint32_t do_get(
-    const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
 {
-    if (!g_map.count(cmd[1]))
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    // lookup
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node)
     {
         return RES_NX;
     }
-    // get val
-    std::string &val = g_map[cmd[1]];
+
+    const std::string &val = container_of(node, Entry, node)->val;
     assert(val.size() <= k_max_msg);
     // copy val.data() to res
     memcpy(res, val.data(), val.size());
@@ -180,20 +221,47 @@ static uint32_t do_get(
 }
 
 static uint32_t do_set(
-    const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
 {
     (void)res;
     (void)reslen;
-    g_map[cmd[1]] = cmd[2];
+    // 构建 Entry
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    // 先看看是否已经存在了key
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node)
+    {
+        // 替换
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    }
+    else
+    {
+        // 插入
+        Entry *ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->val.swap(cmd[2]);
+        hm_insert(&g_data.db, &ent->node);
+    }
+
     return RES_OK;
 }
 
 static uint32_t do_del(
-    const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
 {
     (void)res;
     (void)reslen;
-    g_map.erase(cmd[1]);
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_pop(&g_data.db, &key.node, &entry_eq);
+    if (node)
+    {
+        delete container_of(node, Entry, node);
+    }
     return RES_OK;
 }
 

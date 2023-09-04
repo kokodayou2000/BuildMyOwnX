@@ -261,7 +261,7 @@ int main() {
         for (Conn *conn: fd2conn){
             if (!conn){
                 continue;
-            }
+            }  
             struct pollfd pfd = {};
             // 指定fd
             pfd.fd = conn->fd;

@@ -1,0 +1,1 @@
+g++ -Wall -Wextra -O2 -g 08_server.cpp -o server
