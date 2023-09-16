@@ -8,10 +8,10 @@
 #include <poll.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <sys/socket.h>
 #include <netinet/ip.h>
 #include <string>
 #include <vector>
+#include <math.h>
 // proj
 #include "hashtable.h"
 #include "zset.h"
@@ -274,12 +274,18 @@ static void do_set(
     Entry key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
     // 先看看是否已经存在了key
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (node)
     {
         // 替换
-        container_of(node, Entry, node)->val.swap(cmd[2]);
+        Entry *ent = container_of(node, Entry, node);
+        if (ent->type != T_STR)
+        {
+            return out_err(out, ERR_TYPE, "expect string type");
+        }
+        ent->val.swap(cmd[2]);
     }
     else
     {
@@ -294,6 +300,20 @@ static void do_set(
     return out_nil(out);
 }
 
+static void entry_del(Entry *ent)
+{
+    switch (ent->type)
+    {
+    // 如果是zset类型的key，需要删除tree和hashtable
+    case T_ZSET:
+        zset_dispose(ent->zset);
+        delete ent->zset;
+        break;
+    }
+    // 其余的直接删除即可
+    delete ent;
+}
+
 static void do_del(
     std::vector<std::string> &cmd, std::string &out)
 {
@@ -303,7 +323,7 @@ static void do_del(
     HNode *node = hm_pop(&g_data.db, &key.node, &entry_eq);
     if (node)
     {
-        delete container_of(node, Entry, node);
+        entry_del(container_of(node, Entry, node));
     }
     return out_int(out, node ? 1 : 0);
 }
@@ -338,6 +358,180 @@ static void do_keys(std::vector<std::string> &cmd, std::string &out)
     h_scan(&g_data.db.ht1, &cb_scan, &out);
     h_scan(&g_data.db.ht2, &cb_scan, &out);
 }
+static bool str2dbl(const std::string &s, double &out)
+{
+    char *endp = NULL;
+    // 将字符串转换成浮点数
+    out = strtod(s.c_str(), &endp);
+    // 返回是否转换成功
+    return endp == s.c_str() + s.size() && !isnan(out);
+}
+
+static bool str2int(const std::string &s, int64_t &out)
+{
+    char *endp = NULL;
+    out = strtoll(s.c_str(), &endp, 10);
+    return endp == s.c_str() + s.size();
+}
+
+static void do_zadd(std::vector<std::string> &cmd, std::string &out)
+{
+    double score = 0;
+    if (!str2dbl(cmd[2], score))
+    {
+        return out_err(out, ERR_ARG, "expect fp number");
+    }
+    // 创建
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    // 查找
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    Entry *ent = NULL;
+    if (!hnode)
+    {
+        // 如果不存在就新建一个并插入 hashtable中
+        ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->type = T_ZSET;
+        ent->zset = new ZSet();
+        hm_insert(&g_data.db, &ent->node);
+    }
+    else
+    {
+        // 如果hashtable中存在，要判定对应的这个node是否为ZSET
+        ent = container_of(hnode, Entry, node);
+        if (ent->type != T_ZSET)
+        {
+            return out_err(out, ERR_TYPE, "expect zset");
+        }
+    }
+    // 添加到zset中
+    const std::string &name = cmd[3];
+    bool added = zset_add(ent->zset, name.data(), name.size(), score);
+    return out_int(out, (int64_t)added);
+}
+
+static bool expect_zset(std::string &out, std::string &s, Entry **ent)
+{
+    // 通过s 来判定
+    Entry key;
+    key.key.swap(s);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    if (!hnode)
+    {
+        out_nil(out);
+        return false;
+    }
+
+    *ent = container_of(hnode, Entry, node);
+    if ((*ent)->type != T_ZSET)
+    {
+        out_err(out, ERR_TYPE, "expect zset");
+        return false;
+    }
+    return true;
+}
+// 删除zset 中的一个key
+static void do_zrem(std::vector<std::string> &cmd, std::string &out)
+{
+    Entry *ent = NULL;
+    // 判定是否存在zset
+    if (!expect_zset(out, cmd[1], &ent))
+    {
+        return;
+    }
+    // 要删除的key
+    const std::string &name = cmd[2];
+    // 在zset中删除节点
+    ZNode *znode = zset_pop(ent->zset, name.data(), name.size());
+    if (znode)
+    {
+        // 释放节点本身
+        znode_del(znode);
+    }
+    // 返回删除结果,可能zset中不存在对应key
+    return out_int(out, znode ? 1 : 0);
+}
+
+// 根据名字获取对应score
+static void do_zscore(std::vector<std::string> &cmd, std::string &out)
+{
+    Entry *ent = NULL;
+    if (!expect_zset(out, cmd[1], &ent))
+    {
+        return;
+    }
+    // 获取name
+    const std::string &name = cmd[2];
+    // 根据name获取znode 期中包含 score等信息
+    ZNode *znode = zset_lookup(ent->zset, name.data(), name.size());
+    // 如果存在通过out返回结果。。。 为啥要用return....
+    return znode ? out_dbl(out, znode->score) : out_nil(out);
+}
+
+// 查询 命令: zquery zset score name offset limit
+static void do_zquery(std::vector<std::string> &cmd, std::string &out)
+{
+    // 校验参数
+    double score = 0;
+    if (!str2dbl(cmd[2], score))
+    {
+        return out_err(out, ERR_ARG, "expect fp number");
+    }
+    const std::string &name = cmd[3];
+    int64_t offset = 0;
+    int64_t limit = 0;
+    // 获取偏移量
+    if (!str2int(cmd[4], offset))
+    {
+        return out_err(out, ERR_ARG, "expect int");
+    }
+    // 获取需要查询的数量
+    if (!str2int(cmd[5], limit))
+    {
+        return out_err(out, ERR_ARG, "expect int");
+    }
+
+    // 从 zset 中获取数据
+    Entry *ent = NULL;
+    // 如果zset不存在
+    if (!expect_zset(out, cmd[1], &ent))
+    {
+        if (out[0] == SER_NIL)
+        {
+            out.clear();
+            out_arr(out, 0);
+        }
+        return;
+    }
+
+    // 查询
+    if (limit <= 0)
+    {
+        return out_arr(out, 0);
+    }
+    ZNode *znode = zset_query(
+        ent->zset, score, name.data(), name.size(), offset);
+
+    // 输出
+    out_arr(out, 0);
+    uint32_t n = 0;
+    // 遍历 znode 存在 并且在limit范围内
+    while (znode && (int64_t)n < limit)
+    {
+        // 包装out
+        out_str(out, znode->name, znode->len);
+        out_dbl(out, znode->score);
+        // 通过acl_offset优化查找
+        znode = container_of(avl_offset(&znode->tree, +1), ZNode, tree);
+        n += 2;
+    }
+    return out_update_arr(out, n);
+}
 
 static bool cmd_is(const std::string &word, const char *cmd)
 {
@@ -352,7 +546,6 @@ static bool cmd_is(const std::string &word, const char *cmd)
 static void do_request(
     std::vector<std::string> &cmd, std::string &out)
 {
-
     if (cmd.size() == 1 && cmd_is(cmd[0], "keys"))
     {
         do_keys(cmd, out);
@@ -369,8 +562,25 @@ static void do_request(
     {
         do_del(cmd, out);
     }
+    else if (cmd.size() == 4 && cmd_is(cmd[0], "zadd"))
+    {
+        do_zadd(cmd, out);
+    }
+    else if (cmd.size() == 3 && cmd_is(cmd[0], "zrem"))
+    {
+        do_zrem(cmd, out);
+    }
+    else if (cmd.size() == 3 && cmd_is(cmd[0], "zscore"))
+    {
+        do_zscore(cmd, out);
+    }
+    else if (cmd.size() == 6 && cmd_is(cmd[0], "zquery"))
+    {
+        do_zquery(cmd, out);
+    }
     else
     {
+        // cmd is not recognized
         out_err(out, ERR_UNKNOWN, "Unknown cmd");
     }
 }
